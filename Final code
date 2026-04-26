@@ -1,0 +1,114 @@
+import cv2
+import os
+import numpy as np
+import pandas as pd
+import face_recognition
+import mediapipe as mp
+from ultralytics import YOLO
+
+# --- CONFIGURATION ---
+BASE_PATH = os.getcwd() 
+FACES_DB_FOLDER = os.path.join(BASE_PATH, 'data', 'label_data_2')
+INPUT_VIDEO = os.path.join(BASE_PATH, 'data', 'input2.mp4')
+OUTPUT_CSV = os.path.join(BASE_PATH, 'data', 'thesis_mental_health_report.csv')
+
+# --- 1. LOAD STUDENT DATABASE ---
+known_encodings = []
+known_ids = []
+
+print("Status: Loading Student Database...")
+for file in os.listdir(FACES_DB_FOLDER):
+    if file.lower().endswith(('.jpg', '.png', '.jpeg')):
+        img = face_recognition.load_image_file(os.path.join(FACES_DB_FOLDER, file))
+        encoding = face_recognition.face_encodings(img)
+        if encoding:
+            known_encodings.append(encoding[0])
+            known_ids.append(os.path.splitext(file)[0])
+
+print(f"Success: Loaded {len(known_ids)} students.")
+
+# --- 2. INITIALIZE MODELS ---
+yolo = YOLO('yolov8n.pt')
+mp_face_mesh = mp.solutions.face_mesh.FaceMesh(refine_landmarks=True)
+
+def get_smile_score(landmarks):
+    left, right = landmarks[61], landmarks[291]
+    top, bottom = landmarks[10], landmarks[152]
+    width = np.linalg.norm(np.array([left.x, left.y]) - np.array([right.x, right.y]))
+    height = np.linalg.norm(np.array([top.x, top.y]) - np.array([bottom.x, bottom.y]))
+    return 1 if (width / height) > 0.45 else 0
+
+# --- 3. ANALYSIS ENGINE ---
+def run_prediction():
+    cap = cv2.VideoCapture(INPUT_VIDEO)
+    stats = {uid: {'smiles':0, 'head_down':0, 'interact_frames':0, 'total':0} for uid in known_ids}
+    
+    print("Status: Processing Video (this may take a few minutes)...")
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        
+        results = yolo.track(frame, persist=True, classes=[0], verbose=False)
+        current_frame_students = [] 
+
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box)
+                crop = frame[max(0, y1):y2, max(0, x1):x2]
+                
+                if crop.size == 0: continue
+                rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                
+                # Identify Student
+                encodings = face_recognition.face_encodings(rgb_crop)
+                if encodings:
+                    matches = face_recognition.compare_faces(known_encodings, encodings[0], tolerance=0.5)
+                    if True in matches:
+                        uid = known_ids[matches.index(True)]
+                        stats[uid]['total'] += 1
+                        cx, cy = (x1+x2)//2, (y1+y2)//2
+                        current_frame_students.append((uid, cx, cy))
+
+                        # Analyze Behavior
+                        mesh_res = mp_face_mesh.process(rgb_crop)
+                        if mesh_res.multi_face_landmarks:
+                            lms = mesh_res.multi_face_landmarks[0].landmark
+                            stats[uid]['smiles'] += get_smile_score(lms)
+                            if lms[1].y > lms[234].y: stats[uid]['head_down'] += 1
+
+        # Calculate Interactions (Social Distance)
+        for idx, (id_a, ax, ay) in enumerate(current_frame_students):
+            is_interacting = False
+            for idy, (id_b, bx, by) in enumerate(current_frame_students):
+                if id_a == id_b: continue
+                dist = np.sqrt((ax-bx)**2 + (ay-by)**2)
+                if dist < 180: # Pixel distance threshold
+                    is_interacting = True
+                    break
+            if is_interacting:
+                stats[id_a]['interact_frames'] += 1
+
+    cap.release()
+
+    # --- 4. DATA AGGREGATION ---
+    report = []
+    for uid, data in stats.items():
+        if data['total'] == 0: continue
+        report.append({
+            'Student_ID': uid,
+            'Smiling_Ratio%': round((data['smiles'] / data['total']) * 100, 2),
+            'HeadDown_Ratio%': round((data['head_down'] / data['total']) * 100, 2),
+            'Interaction_Ratio%': round((data['interact_frames'] / data['total']) * 100, 2),
+            'Isolation_Ratio%': round((1 - (data['interact_frames'] / data['total'])) * 100, 2)
+        })
+    
+    df = pd.DataFrame(report)
+    df.to_csv(OUTPUT_CSV, index=False)
+    return df
+
+# Final Execute
+final_report = run_prediction()
+print("\n--- BEHAVIORAL ANALYSIS REPORT ---")
+print(final_report)
